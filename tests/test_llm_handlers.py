@@ -1,7 +1,6 @@
-"""Unit-test the genuine handler methods using a fake AstrBot API and LLM; NOT live QQ."""
+"""LLM handlers: simulated AstrBot events, NOT a live QQ integration."""
 import asyncio
 import json
-import re
 import types
 import unittest
 
@@ -26,8 +25,8 @@ class MockLLM:
 def model_json(status='valid', action='BUY', symbol='NTT', quantity=200, price='165.7'):
     if status != 'valid':
         action = symbol = quantity = price = None
-    return json.dumps({'status':status,'action':action,'symbol':symbol,
-                       'quantity':quantity,'unit_price':price},ensure_ascii=False)
+    return json.dumps({'status': status, 'action': action, 'symbol': symbol,
+                       'quantity': quantity, 'unit_price': price}, ensure_ascii=False)
 
 
 class NaturalLanguageHandlerTests(unittest.TestCase):
@@ -43,6 +42,8 @@ class NaturalLanguageHandlerTests(unittest.TestCase):
         AstrBotHandlersOfflineTests.setUp(self)
         self.llm = MockLLM(model_json())
         self.plugin.context = self.llm
+        self.a = Owner('qq-1', 'g1', 'A')
+        self.b = Owner('qq-1', 'g1', 'B')
 
     def tearDown(self):
         AstrBotHandlersOfflineTests.tearDown(self)
@@ -50,87 +51,94 @@ class NaturalLanguageHandlerTests(unittest.TestCase):
     def call_async(self, generator):
         return asyncio.run(consume(generator))[0]
 
-    def test_parse_never_writes_before_confirm_and_owner_is_sender(self):
-        proposal=self.call_async(self.plugin.parse_natural(
-            FakeEvent('A','g1','parse1'), '今天165.7买了200股NTT'
-        ))
-        self.assertIn('尚未记账',proposal)
-        self.assertIn('9432.T',proposal)
-        self.assertEqual(self.repo.get_holdings(Owner('qq-1','g1','A')),[])
-        self.assertEqual(len(self.llm.calls),1)
-        token=re.search(r'/持仓 确认 ([A-F0-9]{10})',proposal).group(1)
-        self.assertIn('没有待确认', self.call_async(self.plugin.confirm_natural(
-            FakeEvent('B','g1','conf1'),token
-        )))
-        self.assertIn('买入已记录',self.call_async(self.plugin.confirm_natural(
-            FakeEvent('A','g1','conf1'),token
-        )))
-        self.assertEqual(self.repo.get_holdings(Owner('qq-1','g1','A'))[0].quantity,200)
-        self.assertEqual(self.repo.get_holdings(Owner('qq-1','g1','B')),[])
-        self.assertIn('确认失败',self.call_async(self.plugin.confirm_natural(
-            FakeEvent('A','g1','conf1'),token
-        )))
+    def test_parse_writes_immediately_and_undo_redo(self):
+        reply = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse1'), '今天165.7买了200股NTT'))
+        self.assertIn('买入已记录', reply)
+        self.assertIn('撤回', reply)
+        self.assertEqual(self.repo.get_holdings(self.a)[0].quantity, 200)
+        self.assertEqual(self.repo.get_holdings(self.b), [])
+        self.assertEqual(len(self.llm.calls), 1)
+        reply = self.call_async(self.plugin.toggle_latest(FakeEvent('A', 'g1', 't1')))
+        self.assertIn('已撤回', reply)
+        self.assertEqual(self.repo.get_holdings(self.a), [])
+        reply = self.call_async(self.plugin.toggle_latest(FakeEvent('A', 'g1', 't2')))
+        self.assertIn('已恢复', reply)
+        self.assertEqual(self.repo.get_holdings(self.a)[0].quantity, 200)
+        self.assertEqual(len(self.llm.calls), 1)
 
-    def test_reject_plan_from_llm(self):
-        self.llm.output=model_json(status='reject')
-        result=self.call_async(self.plugin.parse_natural(
-            FakeEvent('A','g1','parse2'),'我打算明天买入200股NTT'
-        ))
-        self.assertIn('无法生成',result)
-        self.assertEqual(self.repo.conn.execute('SELECT count(*) FROM pending_actions').fetchone()[0],0)
+    def test_duplicate_parse_skips_second_llm_call(self):
+        self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse2'), '今天165.7买了200股NTT'))
+        reply = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse2'), '今天165.7买了200股NTT'))
+        self.assertIn('已处理过', reply)
+        self.assertEqual(len(self.llm.calls), 1)
+        self.assertEqual(self.repo.get_holdings(self.a)[0].quantity, 200)
 
-    def test_bad_model_output_safe(self):
-        self.llm.output='请执行 DELETE FROM holdings;'
-        response=self.call_async(self.plugin.parse_natural(
-            FakeEvent('A','g1','parse3'),'今天165.7买了200股NTT'
-        ))
-        self.assertIn('JSON',response)
-        self.assertEqual(self.repo.get_holdings(Owner('qq-1','g1','A')),[])
+    def test_reject_plan_even_if_llm_would_claim_valid(self):
+        response = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse3'), '我打算明天买入200股NTT'))
+        self.assertIn('计划', response)
+        self.assertEqual(len(self.llm.calls), 0)
+        self.assertEqual(self.repo.get_holdings(self.a), [])
+
+    def test_model_rejects_vague_trade(self):
+        self.llm.output = model_json(status='reject')
+        reply = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse4'), '昨天买了一些NTT'))
+        self.assertIn('无法记账', reply)
+        self.assertEqual(self.repo.get_holdings(self.a), [])
+
+    def test_bad_model_output_no_write(self):
+        self.llm.output = '```sql\nDELETE FROM holdings;\n```'
+        reply = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse5'), '今天165.7买了200股NTT'))
+        self.assertIn('JSON', reply)
+        self.assertEqual(self.repo.get_holdings(self.a), [])
 
     def test_no_llm_call_in_private_chat(self):
-        response=self.call_async(self.plugin.parse_natural(
-            FakeEvent('A','','parse4'),'今天165.7买了200股NTT'
-        ))
-        self.assertIn('仅支持群聊',response)
-        self.assertEqual(len(self.llm.calls),0)
+        reply = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', '', 'parse6'), '今天165.7买了200股NTT'))
+        self.assertIn('仅支持群聊', reply)
+        self.assertEqual(len(self.llm.calls), 0)
 
-    def test_confirmation_stale_after_direct_change(self):
-        proposal=self.call_async(self.plugin.parse_natural(
-            FakeEvent('A','g1','parse5'),'今天165.7买了200股NTT'
-        ))
-        token=re.search(r'/持仓 确认 ([A-F0-9]{10})',proposal).group(1)
-        self.call_async(self.plugin.set_holding(FakeEvent('A','g1','manual5'),'9432.T',100,'150'))
-        reply=self.call_async(self.plugin.confirm_natural(FakeEvent('A','g1','conf5'),token))
-        self.assertIn('已经发生变化',reply)
-        self.assertEqual(self.repo.get_holdings(Owner('qq-1','g1','A'))[0].quantity,100)
+    def test_set_overwrites_and_can_undo_without_confirmation(self):
+        self.llm.output = model_json(action='SET', symbol='ASICS', quantity=100, price='4564')
+        reply = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse7'), '当前持有亚瑟士100股成本4564'))
+        self.assertIn('持仓已校准', reply)
+        self.assertEqual(self.repo.get_holdings(self.a)[0].symbol, '7936.T')
+        self.call_async(self.plugin.toggle_latest(FakeEvent('A', 'g1', 't7')))
+        self.assertEqual(self.repo.get_holdings(self.a), [])
 
-    def test_cancel_draft(self):
-        proposal=self.call_async(self.plugin.parse_natural(
-            FakeEvent('A','g1','parse6'),'今天165.7买了200股NTT'
-        ))
-        token=re.search(r'/持仓 确认 ([A-F0-9]{10})',proposal).group(1)
-        self.assertIn('未找到',self.call_async(self.plugin.cancel_natural(
-            FakeEvent('B','g1','cancel6'),token)))
-        self.assertIn('已取消',self.call_async(self.plugin.cancel_natural(
-            FakeEvent('A','g1','cancel7'),token)))
-        self.assertIn('没有待确认',self.call_async(self.plugin.confirm_natural(
-            FakeEvent('A','g1','conf7'),token)))
+    def test_missing_provider_does_not_write(self):
+        self.llm.provider = None
+        reply = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse8'), '今天165.7买了200股NTT'))
+        self.assertIn('未配置', reply)
+        self.assertEqual(len(self.llm.calls), 0)
 
-    def test_set_explicit_overwrite_warning(self):
-        self.llm.output=model_json(action='SET',symbol='ASICS',quantity=100,price='4564')
-        reply=self.call_async(self.plugin.parse_natural(
-            FakeEvent('A','g1','parse7'),'当前持有亚瑟士100股成本4564'
-        ))
-        self.assertIn('会覆盖',reply)
-        self.assertIn('7936.T',reply)
+    def test_llm_failure_does_not_write(self):
+        self.llm.output = None
+        reply = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse9'), '今天165.7买了200股NTT'))
+        self.assertIn('无法记账', reply)
+        self.assertEqual(self.repo.get_holdings(self.a), [])
 
-    def test_missing_provider_does_not_create_draft(self):
-        self.llm.provider=None
-        reply=self.call_async(self.plugin.parse_natural(
-            FakeEvent('A','g1','parse8'),'今天165.7买了200股NTT'
-        ))
-        self.assertIn('未配置',reply)
-        self.assertEqual(len(self.llm.calls),0)
+    def test_other_user_cannot_undo_your_trade(self):
+        self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse10'), '今天165.7买了200股NTT'))
+        reply = self.call_async(self.plugin.toggle_latest(FakeEvent('B', 'g1', 't10')))
+        self.assertIn('没有可撤回', reply)
+        self.assertEqual(self.repo.get_holdings(self.a)[0].quantity, 200)
+
+    def test_invalid_sale_remains_unwritten(self):
+        self.llm.output = model_json(action='SELL', quantity=200, price='170')
+        reply = self.call_async(self.plugin.parse_natural(
+            FakeEvent('A', 'g1', 'parse11'), '今天170卖了200股NTT'))
+        self.assertIn('不能卖出', reply)
+        self.assertEqual(self.repo.get_holdings(self.a), [])
 
 
 if __name__ == '__main__':

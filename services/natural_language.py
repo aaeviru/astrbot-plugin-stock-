@@ -1,4 +1,4 @@
-"""Minimal, strict LLM extraction boundary. NO direct database writes."""
+"""Minimal, strict LLM extraction boundary. No database access here."""
 
 import json
 import re
@@ -35,6 +35,22 @@ than per-share price is ambiguous: reject. quantity is an integer number of
 shares (not lots). Only one action, one stock per request; otherwise reject.
 Return null action/symbol/quantity/unit_price when rejecting. No markdown.
 """
+
+
+# Immediate writes need a conservative prefilter: model confidence is NOT proof
+# that a quoted plan or a hypothetical trade has already happened.
+UNCERTAIN_PATTERNS = (
+    r"打算", r"计划", r"准备(?!好了)", r"考虑", r"如果", r"假如",
+    r"假设", r"想买", r"想卖", r"可能会", r"还没", r"未成交",
+    r"没成交", r"未买", r"没买", r"挂单", r"[?？]",
+    r"\b(?:plan to|intend to|would buy|would sell|not yet)\b",
+)
+
+
+def reject_uncertain_intent(text: str) -> None:
+    for pattern in UNCERTAIN_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            raise ValueError("句子包含计划、假设、未成交或疑问语气；请提供实际成交记录")
 
 
 @dataclass(frozen=True)

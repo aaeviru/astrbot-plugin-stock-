@@ -1,140 +1,109 @@
-# 第七讲：自然语言持仓输入，必须本人确认才入账
+# 第七讲：QQ 群自然语言记账与最新输入撤回
 
-本讲延续第六讲的 `astrbot_plugin_portfolio`，将 SQLite 数据库版本升级为 v3，在 `main.py` 增加 `解析 / 确认 / 取消` 三条命令。新的功能默认**只在用户明确发送 `/持仓 解析` 时**调用大模型，而不是监听每条群聊消息。
+本讲在第六讲的公开持仓账本上增加 AI 解析与简单的“撤回/恢复”切换。
 
-## 1. 目标
-
-```text
-群友A: /持仓 解析 今天165.7日元买了200股NTT
-机器人: 【待确认｜尚未记账】
-        操作：实际买入
-        标的：9432.T (JPY)
-        数量：200股
-        价格：165.7
-        执行后数量：300股
-        执行后平均成本：160.47
-        请本人在5分钟内发送 /持仓 确认 45C85ABC12
-群友A: /持仓 确认 45C85ABC12
-机器人: 买入已记录……
-```
-
-上例只是演示；确认码随机生成，不要复制演示里的码。若群友B复制这个码，也**不能**替A确认，因为数据库同时校验发起者的平台、群和用户身份。
-
-## 2. 为什么不让 LLM 直接写数据库？
-
-LLM 只适合做语义抽取。自然语言里可能含有反问、计划、否定、跨语言表达、对话引用或提示注入。股票账本需要可重现的确定性状态变更。写入职责仍留给第五讲的 `SqliteRepository.apply_trade` 逻辑。图示：
+## 1. 先明确交互：提出 → 写入 → 返回 → 可撤回
 
 ```text
-/持仓 解析 原话
-   | 检查群和消息长度
-   v
-AstrBot 的 llm_generate() [只有此步骤消耗模型调用]
-   | 返回严格 JSON: status/action/symbol/quantity/unit_price
-   v
-Python 做严格 JSON / 数据类型 / Decimal / 股票代码校验
-   | 若不明确 -> 拒绝，不记账
-   v
-SQLite pending_actions (保存草稿、原持仓快照、确认码、过期时间)
-   | 在 QQ 群公开显示拟写入结果（尚未入账）
-   v
-/持仓 确认 CODE（或取消 CODE）
-   | 重新校验平台 + 群 + 本人 + CODE + 过期 + 旧持仓是否被改过
-   v
-BEGIN IMMEDIATE -> 更新 holdings + 追加 trades + 删除 pending -> COMMIT
+群友：/持仓 记 今天165.7买了200股NTT
+机器人：买入已记录；NTT 200股 @165.7；当前持仓...；有误请 /持仓 撤回
+群友：/持仓 撤回
+机器人：已撤回最新输入；NTT 当前持仓恢复为操作前状态
+群友：/持仓 撤回
+机器人：已恢复最新输入；NTT 当前持仓恢复为操作后状态
 ```
 
-普通 `/持仓 买入`、`卖出`、`设置`、`查看`、`名单`、`汇总` 仍是**零 LLM 调用**的确定性命令。
+用户没有必要输入“确认”。一条完整、明确、已成交的描述经模型解析和 Python 校验后**立即记账**。群友可以检查回执，不正确时撤回。对计划、疑问句、未成交、多个标的、缺失股数/单价，拒绝而非猜测。
 
-## 3. 使用 AstrBot 当前 LLM 接口
+其他命令继续保持精确语法：`/持仓 设置`、`买入`、`卖出`、`查看`、`名单`、`汇总`、`历史`。普通聊天不会触发模型；只有 `/持仓 记` 用一次 LLM 请求。
 
-根据 AstrBot 官方 `docs/zh/dev/star/guides/ai.md`（v4.5.7 后的 API）：
+## 2. AstrBot 的 AI 接口
 
-```python
+```py
 provider_id = await self.context.get_current_chat_provider_id(
     event.unified_msg_origin
 )
 response = await self.context.llm_generate(
     chat_provider_id=provider_id,
     system_prompt=SYSTEM_PROMPT,
-    prompt='请解析这条用户消息，只输出JSON: ...',
+    prompt=user_text,
 )
-text = response.completion_text
+parsed = parse_model_response(response.completion_text)
 ```
 
-完整实现见 `main.py` 的 `parse_natural()`。这里仅调用单次聊天模型生成，**不使用 Agent / tool_loop_agent / 自动工具调用**。不把其他群成员的持仓内容传给模型；只发送该用户明确提交的文字描述。
+使用 SDK 的无工具 `llm_generate()` 而不是让 Agent 直接执行数据库 Tool。模型只返回 JSON 格式的交易建议，`services/natural_language.py` 负责严格检验返回结构、别名和数值。`reject_uncertain_intent()` 会在付费调用模型**之前**保守拒绝部分计划/假设/疑问表达。即使通过，模型仍可能误解，因此机器人回执应清晰展示真实写入的数量和价格。
 
-- 显式命令 `/持仓 解析` 控制模型调用和 API 费用。
-- 模型不配置、返回格式错误或网络报错：拒绝写入，提示使用标准指令。
-- `SYSTEM_PROMPT` 指示模型不要猜测股票代码、缺失数量/单价，并拒绝计划、假设、否定和意图不明的句子。
-- 系统提示不是安全边界；安全边界是 `parse_model_response()` 的结构化验证与必须手动确认。
-
-## 4. 为什么 JSON 解析仍要严格验证？
-
-解析器 `services/natural_language.py` 只接受：
+预期 JSON：
 
 ```json
-{
-  "status": "valid",
-  "action": "BUY",
-  "symbol": "NTT",
-  "quantity": 200,
-  "unit_price": "165.7"
-}
+{"status":"valid","action":"BUY","symbol":"NTT","quantity":200,"unit_price":"165.7"}
 ```
 
-不能包含 `owner_id`、`user_id`、`sql` 等多余字段；`quantity` 必须是整数，`unit_price` 必须是十进制字符串。模型输出不完整、类型错误、多笔混杂、价格不合法，直接拒绝。`status=reject` 也拒绝写入。
+所有者不允许由模型提供；写入身份必须由当前 `event` 提供。`unit_price` 使用 Decimal 字符串，禁止未知 JSON 属性。模型无效或超额卖出会停止操作。消息回执后不需要发第二条确认命令。
 
-股票名字只支持**显式白名单**：`NTT -> 9432.T`、`ASICS/亚瑟士 -> 7936.T`、`英伟达 -> NVDA`，并支持本来就是规范证券代码的输入。其他中文公司名需要改用股票代码；不会让模型擅自猜出证券标识。
+## 3. 为什么「撤回」是单个状态开关，而不是撤销栈？
 
-这是入门版本的有限白名单，不是行情服务或证券代码验证。将来可添加独立证券主数据表，由用户确认标的映射。
+每位用户在每个群里只有一条 `latest_input`，主键为：
 
-## 5. 为什么使用 SQLite 待确认表？
+```text
+(platform_id, group_id, user_id)
+```
 
-数据库新增 `pending_actions`，字段包括平台 ID、群 ID、发送者 ID、动作/代码/数量/单价、随机 `token`、来源消息 ID、原持仓快照、创建时间和过期时间。
+它存储最新一次**成功输入**的交易 ID、股票、原状态、新状态、是否生效。新输入自动覆盖这一条记录中的撤回目标，但不修改以前的交易历史。
 
-- 唯一主键是 `platform_id + group_id + user_id`，每名用户在每群同时最多有**一条**待确认操作；新的解析替换旧草稿。
-- 草稿保存在 SQLite，而不是 Python 内存，热重载或容器重新启动后可以继续确认尚未到期的草稿。
-- 确认有效期默认 **300 秒**。
-- 即使第三者知道 token，也不能跨用户确认或取消。
-- 草稿创建时计算一次预览，确认时重新检查 `quantity + total_cost + updated_at` 原持仓快照，防止期间普通命令改变了持仓。
-- **删除草稿 + 更新持仓 + 追加交易**发生在同一个 SQLite 事务。数据库出错会同时回滚。
-- 交易历史的 `source_message_id` 保存**确认消息 ID**，保证重发相同确认消息不会重复入账。
+例如：
 
-不应把原始语句、用户 QQ ID 或完整群历史上传到额外 LLM 日志。SQLite 草稿过期后仅在确认或后续新草稿时处理；当前版本不含后台定时清理任务，可以后增加简单的定期清理。
+| 顺序 | 输入或操作 | NTT | ASICS | 下次撤回目标 |
+|---|---|---:|---:|---|
+| 1 | 设置 NTT 100 | 100 | 0 | 设置 NTT |
+| 2 | 买入 NTT 200 | 300 | 0 | 买入 NTT |
+| 3 | 撤回 | 100 | 0 | 仍是买入 NTT |
+| 4 | 再次撤回 | 300 | 0 | 仍是买入 NTT |
+| 5 | 买入 ASICS 10 | 300 | 10 | 买入 ASICS |
+| 6 | 撤回 | 300 | 0 | 仍是买入 ASICS |
 
-## 6. 指令与负例
+撤回操作本身不是新的持仓输入；连续发送不同的 `/持仓 撤回` 消息，就是在最近这笔输入的操作前、操作后两个快照之间切换。新输入会替换当前切换目标，不会产生一整条撤销/重做栈。没有确认码、撤销编号或时间窗口。
 
-| 用户操作 | 行为 |
-|---|---|
-| `/持仓 解析 今天165.7买了200股NTT` | 请求模型解析；展示待确认 BUY |
-| `/持仓 解析 目前NTT共300股，成本160.47` | 可能识别为 SET；提醒会覆盖原记录，必须确认 |
-| `/持仓 解析 我打算明天买200股NTT` | 计划，不是已成交；应拒绝 |
-| `/持仓 解析 昨天买了NTT` | 缺股数和单价，拒绝 |
-| `/持仓 确认 ABCDEF0123` | 只有创建草稿的人能在有效期内确认 |
-| `/持仓 取消 ABCDEF0123` | 取消本人的草稿，绝不入账 |
-| `/持仓 买入 9432.T 200 165.7` | 原有的直接指令，完全不调用 AI |
+## 4. 数据库 v4
 
-模型可能把不明确的自然语言解释成错误动作，因此读懂预览再确认是使用者必须完成的一步。`SET` 永远需要尤其认真核对，因为它会覆盖旧持仓数量与成本。
+- `trades.is_active`：表示某次输入目前是否生效；已撤回的历史记录仍可查询。
+- `latest_input`：每位用户/每群一条，保存原持仓数量、成本、更新时间和执行后的同类快照。
+- `toggle_events`：只记录撤回消息 ID、针对的交易 ID、切换后的状态；用来保证消息重投递不会连续反转两次。
 
-## 7. 运行测试
+由于旧的 `trades` 表没有完整的操作前快照，**只有升级到 v4 后新增的交易支持撤回/恢复**。原有持仓及历史安全保留。旧 v3 未入账确认草稿 (`pending_actions`) 在升级时被删除；新的简化流程不再使用确认码。
 
-仓库克隆后，为兼容相对导入和 `unittest`，建议在父目录使用如下目录名：
+## 5. SQLite 原子切换
+
+在一个 `BEGIN IMMEDIATE` 事务中：
+
+1. 校验来自 QQ 事件的 `(platform_id, group_id, user_id)` 与新消息 ID。
+2. 检查交易历史、撤回事件和旧解析消息是否已处理相同消息 ID。
+3. 查询当前用户最新的 `latest_input`；如果没有新版本输入，拒绝撤回。
+4. 校验当前持仓与预期快照一致（防止其他代码直接更改数据库导致覆盖数据）。
+5. 将 `holdings` 恢复为操作前快照（撤销）或操作后快照（恢复）。
+6. 同时更新 `trades.is_active`、`latest_input.active` 并追加 `toggle_events` 去重记录。
+7. 统一 `COMMIT`，任一步出错则 `ROLLBACK`。
+
+没有使用 `await`，也没有在事务内部调用模型。第一版依然假定单 AstrBot 进程 / 单 Python 线程使用此连接，不允许多个进程共享同一连接。
+
+## 6. 执行测试与验收
 
 ```sh
-git clone https://github.com/aaeviru/astrbot-plugin-stock-.git astrbot_plugin_portfolio
 python -m unittest discover -s astrbot_plugin_portfolio/tests -v
 ```
 
-覆盖：原账本功能、数据库从 v1/v2 升级到 v3、LLM JSON 验证、模型拒绝时零写入、本人确认、跨用户/跨群权限、过期、草稿替换、原持仓变化后的拒绝、数据库写入失败回滚、重复确认、重载后继续确认、模拟 AstrBot handler。
+重点测试：
 
-模拟 handler 使用本地桩，不等于实际 QQ 平台或真实 LLM 调用。必须先在测试群验证模型返回 JSON、QQ 指令参数解析、确认码操作和 AstrBot 日志。
+- `test_undo_redo_is_a_switch_not_stack`：连续撤销、恢复、再撤销。
+- `test_new_input_replaces_toggle_target_after_undo`：旧的撤销不会被新输入意外恢复。
+- `test_full_sale_undo_restores_cost_and_realized_history`：全额卖出后撤销能恢复原成本。
+- `test_duplicate_toggle_does_not_toggle_twice`：QQ 重投递同一消息不能执行两次。
+- `test_failure_to_record_toggle_rolls_back_position_and_flag`：模拟数据库写入失败后状态仍一致。
+- `test_per_owner_per_group_per_platform`：同一群其他人无法撤回你的数据。
+- `test_migration_v3_keeps_old_data_but_does_not_undo_legacy`：旧数据保留且迁移清晰。
 
-## 8. 何时可考虑自动识别所有群消息？
+**真实 QQ 平台与 LLM Provider 尚未在这里联调。** 在 NAS 测试群中核对数据后再正式启用。
 
-第一版**不建议**这样做：所有群消息都可能触发模型调用、增加费用，还可能错误读取聊天中的假设买卖。以后若群友确有需求，可提供**群级开关 + 明确提及机器人 + 单人每日限额 + 仍需确认**的模式，但不应默认开启。
+## 7. 暂不扩展的功能
 
-## 9. 与 PostgreSQL 的关系
-
-新 `pending_actions` 同样位于 Repository 层。迁移时将其转换成 PostgreSQL 表即可，LLM 解析代码不关心数据库类型；原子确认要用 PostgreSQL 的事务和并发锁重新实现并重测。
-
-**参考**：[AstrBot AI 插件官方指南](https://docs.astrbot.app/dev/star/guides/ai.html)；[AstrBot 消息指令指南](https://docs.astrbot.app/dev/star/guides/listen-message-event.html)。
+多级撤销、选择历史交易进行撤销、批准步骤、定时自动确认、自然语言自动监听全群消息、对接券商下单，都不在当前范围。若更早的输入确实有误，用 `/持仓 设置` 校准。

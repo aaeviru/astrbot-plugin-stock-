@@ -34,6 +34,7 @@ class Trade:
     quantity_after: int
     cost_after: Decimal
     recorded_at: str
+    is_active: bool = True
 
 
 @dataclass(frozen=True)
@@ -67,14 +68,8 @@ class GroupPosition:
 
 
 @dataclass(frozen=True)
-class DraftPreview:
-    token: str
-    action: str
+class ToggleResult:
     symbol: str
     currency: str
-    quantity: int
-    unit_price: Decimal
-    quantity_after: int
-    cost_after: Decimal
-    realized_pnl: Decimal
-    expires_at: str
+    now_active: bool
+    holding: Holding | None
