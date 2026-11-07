@@ -11,6 +11,7 @@ from astrbot.core.star.filter.command import GreedyStr
 from .identity import get_actor, resolve_read_target
 from .repositories.sqlite import DuplicateMessageError, SqliteRepository
 from .services.natural_language import SYSTEM_PROMPT, parse_model_response, reject_uncertain_intent
+from .services.quotes import AktoolsQuoteService, compute_valuation, signed_money, signed_percent
 
 
 def money(value: Decimal) -> str:
@@ -23,6 +24,7 @@ class PortfolioPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.repo: SqliteRepository | None = None
+        self.quotes = AktoolsQuoteService(context)
 
     async def initialize(self):
         data_dir = StarTools.get_data_dir("astrbot_plugin_portfolio")
@@ -180,13 +182,47 @@ class PortfolioPlugin(Star):
         lines = [
             f"本群持仓汇总：{members} 人、{len(positions)} 种股票（第 {page}/{pages} 页）"
         ]
+        quotes = await self.quotes.fetch_many([p.symbol for p in items])
+        total_cost_cny = total_value_cny = Decimal("0")
+        priced_cny = 0
+        all_cny = 0
+        fetched_at = ""
         for position in items:
             lines.append(
                 f"{position.symbol}：{position.holder_count} 人 / "
                 f"{position.quantity} 股 / "
                 f"群加权成本 {money(position.average_cost)} {position.currency}"
             )
-        lines.append("只汇总相同标的和币种，不代表当前市值。")
+            lookup = quotes[position.symbol]
+            if position.currency == "CNY":
+                all_cny += 1
+            if lookup.quote is None:
+                lines.append(f"  行情：{lookup.reason}")
+                continue
+            value, pnl, rate = compute_valuation(
+                position.quantity, position.total_cost, lookup.quote
+            )
+            fetched_at = lookup.quote.fetched_at
+            lines.append(
+                f"  最新可用价 {lookup.quote.price} {position.currency} | "
+                f"市值 {money(value)} | 浮盈亏 {signed_money(pnl)} "
+                f"({signed_percent(rate)})"
+            )
+            if position.currency == "CNY":
+                total_cost_cny += position.total_cost
+                total_value_cny += value
+                priced_cny += 1
+        if priced_cny:
+            diff = total_value_cny - total_cost_cny
+            label = "全部" if priced_cny == all_cny else "部分"
+            rate = diff / total_cost_cny * 100 if total_cost_cny else None
+            lines.append(
+                f"本页已报价 A 股{label}小计：市值 {money(total_value_cny)} CNY / "
+                f"浮盈亏 {signed_money(diff)} CNY ({signed_percent(rate)})"
+            )
+        if fetched_at:
+            lines.append(f"报价来源：AKShare / 东方财富；抓取于 {fetched_at}")
+        lines.append("行情仅 A 股；AKShare 报价可能延迟或停留在最近交易日，不代表当前可成交价。")
         yield event.plain_result("\n".join(lines))
 
     @portfolio.command("查看")
@@ -211,12 +247,47 @@ class PortfolioPlugin(Star):
             yield event.plain_result("该群友尚未登记任何持仓")
             return
 
+        quotes = await self.quotes.fetch_many([h.symbol for h in holdings])
         lines = [f"{target_label} 的公开持仓："]
+        total_cost_cny = total_value_cny = Decimal("0")
+        priced_cny = 0
+        all_cny = 0
+        fetched_at = ""
         for h in holdings:
             lines.append(
                 f"{h.symbol}：{h.quantity} 股 / "
                 f"成本 {money(h.average_cost)} {h.currency}"
             )
+            if h.currency == "CNY":
+                all_cny += 1
+            lookup = quotes[h.symbol]
+            if lookup.quote is None:
+                lines.append(f"  行情：{lookup.reason}")
+                continue
+            value, pnl, rate = compute_valuation(
+                h.quantity, h.total_cost, lookup.quote
+            )
+            fetched_at = lookup.quote.fetched_at
+            lines.append(
+                f"  最新可用价 {lookup.quote.price} {h.currency} | "
+                f"市值 {money(value)} | 浮盈亏 {signed_money(pnl)} "
+                f"({signed_percent(rate)})"
+            )
+            if h.currency == "CNY":
+                total_cost_cny += h.total_cost
+                total_value_cny += value
+                priced_cny += 1
+        if priced_cny:
+            diff = total_value_cny - total_cost_cny
+            label = "全部" if priced_cny == all_cny else "部分"
+            rate = diff / total_cost_cny * 100 if total_cost_cny else None
+            lines.append(
+                f"已报价 A 股{label}小计：市值 {money(total_value_cny)} CNY / "
+                f"浮盈亏 {signed_money(diff)} CNY ({signed_percent(rate)})"
+            )
+        if fetched_at:
+            lines.append(f"报价来源：AKShare / 东方财富；抓取于 {fetched_at}")
+        lines.append("行情可能延迟，休市时为最近可用价；抓取时间不等于交易所报价时间。")
         yield event.plain_result("\n".join(lines))
 
     @portfolio.command("历史")
