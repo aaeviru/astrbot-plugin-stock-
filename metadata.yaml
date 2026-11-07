@@ -3,7 +3,7 @@ display_name: 群友持仓记录
 desc: 按群与用户隔离的持仓记账插件，本人修改、群内公开查询
 version: v0.3.0
 author: aaeviru
-repo: https://github.com/aaeviru/astrbot-plugin-stock-
+repo: https://github.com/aaeviru/astrbot_plugin_portfolio
 support_platforms:
   - aiocqhttp
   - qq_official
