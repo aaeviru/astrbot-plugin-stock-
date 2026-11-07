@@ -1,0 +1,20 @@
+name: Python tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out as Python package
+        uses: actions/checkout@v4
+        with:
+          path: astrbot_plugin_portfolio
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run offline tests
+        run: python -m unittest discover -s astrbot_plugin_portfolio/tests -v
