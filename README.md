@@ -1,6 +1,6 @@
 # 群友持仓记录（AstrBot）
 
-**教学版 v0.2.0（第六讲）**。在第五讲的 SQLite 持仓账本上增加：群成员公开名单、群内稳定编号、全群持仓汇总、身份权限单测、QQ @ 提及的降级查询。
+**教学版 v0.3.0（第七讲）**。在 v0.2.0 群内公开账本上增加：自然语言单笔交易解析、SQLite 待确认草稿、本人二次确认、过期及持仓快照保护。直接命令不使用 LLM。
 
 > 本插件登记用户主动填写的持仓与交易，不连接券商，也不会执行真实证券交易。群内成员可查看别人主动登记的持仓；仅发起消息的本人可更改自己的持仓。
 
@@ -30,6 +30,9 @@ https://github.com/aaeviru/astrbot-plugin-stock-
 /持仓 汇总                         # 全群按股票汇总（前 10 只）
 /持仓 汇总 2                       # 下一页
 /持仓 历史                         # 仅本人可查询历史
+/持仓 解析 今天165.7买了200股NTT      # 消耗一次 LLM 调用；尚未记账
+/持仓 确认 A1B2C3D4E5             # 只能本人确认，5分钟有效
+/持仓 取消 A1B2C3D4E5             # 本人取消草稿
 /持仓 帮助
 ```
 
@@ -47,7 +50,16 @@ https://github.com/aaeviru/astrbot-plugin-stock-
 - `@群友`：OneBot 可能提供结构化的 `At(qq=...)`；QQ 官方机器人群聊可能只提供 `member_openid`、不提供可用于指定其他人的 At 段。因此 **优先推荐** `/持仓 名单` + `/持仓 查看 #编号`。适配器能力需要在实际 QQ 环境验证。
 - 公告和账本都对**当前群内能够发指令的成员**可见，没有对真实 QQ 群成员列表做在线校验；不要登记不愿在群内公开的资产。
 
-## 数据库 v1 -> v2 升级
+## 第七讲自然语言输入
+
+- **只在** `/持仓 解析 文字` 时调用一次 AstrBot 已配置的聊天模型，其他指令没有模型调用成本。
+- 模型只生成 JSON 提议，严格校验后存入 `pending_actions`，**不直接写入 holdings/trades**。
+- 必须由原发送者输入 `/持仓 确认 随机码`，还须在五分钟内、原持仓未变化的前提下才能写入。
+- 不确定的计划或缺少数量/每股价格应被拒绝；单次只支持一个标的、一个操作。
+- LLM 调用没有取得确定性结果时，直接提示用户使用标准命令。当前仅提供明确的中文/英文证券别名，不猜代码。
+- 教学说明见 [docs/LESSON_07.md](docs/LESSON_07.md)。
+
+## 数据库 v1 -> v2 -> v3 升级
 
 从第五讲的数据结构 `user_version=1` 升级到本版 `user_version=2`：
 
@@ -55,11 +67,14 @@ https://github.com/aaeviru/astrbot-plugin-stock-
 2. 将原有 `holdings` 和 `trades` 中出现过的用户补录为登记用户，编号在每群内按用户 ID 稳定排序赋予。
 3. 使用一个数据库事务提交迁移结果和版本号，原有交易记录和持仓不会被删除。
 
+第七讲新增 `pending_actions` 表（`user_version=3`），v2 的 holdings/trades/portfolio_members 均保留。
+
 **建议升级前先备份**：停止插件/容器后备份 `portfolio.db`，或者在数据库仍运行时使用 Python `sqlite3.Connection.backup()` 在线备份。不要直接复制正在写入中的 WAL 文件组合，也不要将数据库提交到 Git。
 
 - `holdings`：当前持仓、复合主键
 - `trades`：交易历史、消息 ID 去重，原子更新
 - `portfolio_members`：每群递增固定编号、昵称显示快照
+- `pending_actions`：每用户每群一个未确认的自然语言草稿，五分钟有效
 - 用 Python Decimal 汇总相同股票和币种的持仓；避免在 SQLite 中用浮点 `SUM(total_cost)` 计算十进制文本。
 
 ## 自动化测试
@@ -76,7 +91,7 @@ git clone https://github.com/aaeviru/astrbot-plugin-stock-.git astrbot_plugin_po
 python -m unittest discover -s astrbot_plugin_portfolio/tests -v
 ```
 
-测试覆盖：原 15 项账本逻辑、新增数据迁移、编号持久化、全群聚合、跨群/跨平台隔离、权限解析、消息去重、事务回滚、以及使用 AstrBot API 模拟桩的命令 Handler 验证。
+测试覆盖：原 15 项账本逻辑、新增数据迁移、编号持久化、全群聚合、跨群/跨平台隔离、权限解析、消息去重、事务回滚、以及使用 AstrBot API 模拟桩的命令 Handler 验证，还包括自然语言 JSON 严格验证、确认码、过期、快照变化和模拟 LLM 调用。
 
 命令 Handler 测试使用的是**模拟事件**，不是对真实 OneBot/QQ 官方适配器的集成测试。必须在测试 QQ 群中试用 `@`、`#` 和命令解析再正式使用。
 
@@ -86,6 +101,7 @@ python -m unittest discover -s astrbot_plugin_portfolio/tests -v
 - `identity.py`：由消息事件获得本人身份；从真实 At 段解析读取目标
 - `services/access.py`：不依赖 AstrBot 的目标解析与验证
 - `services/portfolio.py`：纯 Decimal 买卖计算
+- `services/natural_language.py`：LLM JSON 验证及证券别名白名单
 - `models.py`：Owner、Holding、Trade、GroupMember、GroupPosition 等结构
 - `repositories/sqlite.py`：SQL、事务、写入去重、迁移、全群聚合
 - `tests/`：离线 unittest

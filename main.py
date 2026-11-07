@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 from decimal import Decimal, ROUND_HALF_UP
@@ -5,9 +6,11 @@ from decimal import Decimal, ROUND_HALF_UP
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.star.filter.command import GreedyStr
 
 from .identity import get_actor, resolve_read_target
 from .repositories.sqlite import DuplicateMessageError, SqliteRepository
+from .services.natural_language import SYSTEM_PROMPT, parse_model_response
 
 
 def money(value: Decimal) -> str:
@@ -53,6 +56,10 @@ class PortfolioPlugin(Star):
             logger.exception("Portfolio: 写入失败")
             return "数据库写入失败，未完成本次操作，请联系管理员检查日志"
 
+        return self._format_write_result(result)
+
+    @staticmethod
+    def _format_write_result(result) -> str:
         holding = result.holding
         if holding is None:
             result_text = f"{result.symbol} 已清仓，操作记录已保留"
@@ -257,6 +264,124 @@ class PortfolioPlugin(Star):
             f"本群登记编号：{'#' + str(member_no) if member_no else '尚未登记'}"
         )
 
+    @portfolio.command("解析")
+    async def parse_natural(self, event: AstrMessageEvent, text: GreedyStr):
+        """仅显式调用 AI 解析一次单笔已成交交易，不自动记账"""
+        if self.repo is None:
+            yield event.plain_result("持仓数据库尚未初始化")
+            return
+        try:
+            actor = get_actor(event)
+            original_message_id = str(
+                getattr(event.message_obj, "message_id", "") or ""
+            ).strip()
+            if not original_message_id:
+                raise ValueError("消息没有稳定的 ID，无法安全创建待确认记录")
+            source = str(text or "").strip()
+            if not 4 <= len(source) <= 240:
+                raise ValueError("请提供 4～240 字的单笔买卖或持仓描述")
+        except ValueError as exc:
+            yield event.plain_result(f"解析失败：{exc}")
+            return
+
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(
+                event.unified_msg_origin
+            )
+            if not provider_id:
+                yield event.plain_result("当前会话未配置聊天模型，请配置后重试")
+                return
+            response = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                system_prompt=SYSTEM_PROMPT,
+                prompt="请解析以下用户消息，只返回规定的 JSON：\n"
+                       + json.dumps({"text": source}, ensure_ascii=False),
+            )
+            parsed = parse_model_response(response.completion_text)
+        except ValueError as exc:
+            yield event.plain_result(f"无法生成交易草稿：{exc}")
+            return
+        except Exception:
+            logger.exception("Portfolio: LLM 解析请求失败")
+            yield event.plain_result("模型服务不可用，暂未记账；可改用标准买卖指令")
+            return
+
+        try:
+            draft = self.repo.create_draft(actor, original_message_id, parsed)
+        except DuplicateMessageError as exc:
+            yield event.plain_result(str(exc))
+            return
+        except ValueError as exc:
+            yield event.plain_result(f"无法创建确认草稿：{exc}")
+            return
+        except sqlite3.Error:
+            logger.exception("Portfolio: 创建待确认草稿失败")
+            yield event.plain_result("数据库操作失败，未记账")
+            return
+
+        label = {"SET": "设置/覆盖持仓", "BUY": "实际买入", "SELL": "实际卖出"}[draft.action]
+        average = (
+            money(draft.cost_after / draft.quantity_after)
+            if draft.quantity_after else "无"
+        )
+        msg = (
+            "【待确认｜尚未记账】\n"
+            f"操作：{label}\n标的：{draft.symbol} ({draft.currency})\n"
+            f"数量：{draft.quantity} 股\n价格：{draft.unit_price}\n"
+            f"执行后数量：{draft.quantity_after} 股\n"
+            f"执行后平均成本：{average}\n"
+        )
+        if draft.action == "SELL":
+            msg += f"预计本次已实现盈亏：{money(draft.realized_pnl)}\n"
+        if draft.action == "SET":
+            msg += "注意：设置会覆盖现有数量与成本，并非真实交易。\n"
+        msg += (
+            f"请本人在 5 分钟内发送：/持仓 确认 {draft.token}\n"
+            f"放弃则发送：/持仓 取消 {draft.token}"
+        )
+        yield event.plain_result(msg)
+
+    @portfolio.command("确认")
+    async def confirm_natural(self, event: AstrMessageEvent, token: str):
+        """本人确认才调用事务写入；token 只是草稿凭据而非身份"""
+        if self.repo is None:
+            yield event.plain_result("持仓数据库尚未初始化")
+            return
+        try:
+            actor = get_actor(event)
+            message_id = str(getattr(event.message_obj, "message_id", "") or "")
+            result = self.repo.confirm_draft(
+                actor, token, message_id, display_name=event.get_sender_name(),
+            )
+        except (DuplicateMessageError, ValueError) as exc:
+            yield event.plain_result(f"确认失败：{exc}")
+            return
+        except sqlite3.Error:
+            logger.exception("Portfolio: 确认交易失败")
+            yield event.plain_result("数据库写入失败，未完成本次操作")
+            return
+        yield event.plain_result(self._format_write_result(result))
+
+    @portfolio.command("取消")
+    async def cancel_natural(self, event: AstrMessageEvent, token: str):
+        """只有草稿本人可取消"""
+        if self.repo is None:
+            yield event.plain_result("持仓数据库尚未初始化")
+            return
+        try:
+            actor = get_actor(event)
+            removed = self.repo.cancel_draft(actor, token)
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        except sqlite3.Error:
+            logger.exception("Portfolio: 取消草稿失败")
+            yield event.plain_result("数据库操作失败")
+            return
+        yield event.plain_result(
+            "已取消该草稿，持仓未改变" if removed else "未找到本人可取消的草稿"
+        )
+
     @portfolio.command("帮助")
     async def help(self, event: AstrMessageEvent):
         yield event.plain_result(
@@ -268,5 +393,7 @@ class PortfolioPlugin(Star):
             "/持仓 汇总 [页码]\n"
             "/持仓 历史\n"
             "/持仓 身份\n"
+            "/持仓 解析 今天165.7买了200股NTT\n"
+            "/持仓 确认 <确认码> /持仓 取消 <确认码>\n"
             "SET 用于校准；买卖用于记录真实交易；仅本人可更改。"
         )

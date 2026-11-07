@@ -1,12 +1,14 @@
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
+from secrets import token_hex
 
-from ..models import GroupMember, GroupPosition, Holding, Owner, Trade, WriteResult
+from ..models import DraftPreview, GroupMember, GroupPosition, Holding, Owner, Trade, WriteResult
 from ..services.portfolio import calculate_change, normalize_symbol, parse_price
+from ..services.natural_language import ParsedAction
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS holdings (
@@ -59,6 +61,39 @@ CREATE TABLE IF NOT EXISTS portfolio_members (
 """
 
 
+PENDING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS seen_parse_requests (
+    platform_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    source_message_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    PRIMARY KEY (platform_id, group_id, source_message_id)
+)
+"""
+
+PENDING_ACTIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pending_actions (
+    platform_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    action TEXT NOT NULL CHECK(action IN ('SET', 'BUY', 'SELL')),
+    symbol TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit_price TEXT NOT NULL,
+    original_message_id TEXT NOT NULL,
+    expected_quantity INTEGER NOT NULL,
+    expected_cost TEXT NOT NULL,
+    expected_updated_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (platform_id, group_id, user_id),
+    UNIQUE (platform_id, group_id, original_message_id)
+)
+"""
+
+
 def clean_display_name(raw: str) -> str:
     """A nickname is display-only, never an identity or authorization key."""
     value = " ".join(str(raw or "").split()).replace("@", "＠")
@@ -84,7 +119,7 @@ class SqliteRepository:
         self.conn = db
         try:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise RuntimeError(f"不支持的数据库版本：{version}")
             # executescript may implicitly commit, so run it BEFORE our migration
             # transaction, never in the middle of a business transaction.
@@ -93,7 +128,9 @@ class SqliteRepository:
                 conn.execute(MEMBER_SCHEMA)
                 if version in (0, 1):
                     self._backfill_members(conn)
-                conn.execute("PRAGMA user_version = 2")
+                conn.execute(PENDING_SCHEMA)
+                conn.execute(PENDING_ACTIONS_SCHEMA)
+                conn.execute("PRAGMA user_version = 3")
         except Exception:
             self.close()
             raise
@@ -287,91 +324,230 @@ class SqliteRepository:
         return sorted(result, key=lambda r: (-r.holder_count, r.symbol, r.currency))
 
     def apply_trade(
-        self,
-        actor: Owner,
-        source_message_id: str,
-        action: str,
-        raw_symbol: str,
-        quantity: int,
-        raw_price: str,
+        self, actor: Owner, source_message_id: str, action: str,
+        raw_symbol: str, quantity: int, raw_price: str, display_name: str = "",
+    ) -> WriteResult:
+        """Public deterministic path; write ledger + audit atomically."""
+        with self.transaction() as conn:
+            return self._apply_trade_tx(
+                conn, actor, source_message_id, action, raw_symbol, quantity,
+                raw_price, display_name,
+            )
+
+    def _apply_trade_tx(
+        self, conn: sqlite3.Connection, actor: Owner, source_message_id: str,
+        action: str, raw_symbol: str, quantity: int, raw_price: str,
         display_name: str = "",
     ) -> WriteResult:
-        """All reads and writes in this function use the trusted actor scope."""
+        """Internal only: caller MUST own BEGIN IMMEDIATE transaction."""
         if not all((actor.platform_id, actor.group_id, actor.user_id)):
             raise ValueError("发送者身份不完整")
         message_id = str(source_message_id or "").strip()
         if not message_id:
             raise ValueError("缺少消息 ID，拒绝写入以避免重复记账")
-
         symbol, currency = normalize_symbol(raw_symbol)
         price = parse_price(raw_price)
-        db = self._db()
         now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         scope = (actor.platform_id, actor.group_id, actor.user_id, symbol)
 
-        with self.transaction() as conn:
-            duplicate = conn.execute(
-                """SELECT 1 FROM trades
-                   WHERE platform_id=? AND group_id=? AND source_message_id=?""",
-                (actor.platform_id, actor.group_id, message_id),
-            ).fetchone()
-            if duplicate:
-                raise DuplicateMessageError("这条 QQ 消息已经记过账，不会重复执行")
+        duplicate = conn.execute(
+            """SELECT 1 FROM trades
+               WHERE platform_id=? AND group_id=? AND source_message_id=?""",
+            (actor.platform_id, actor.group_id, message_id),
+        ).fetchone()
+        if duplicate:
+            raise DuplicateMessageError("这条 QQ 消息已经记过账，不会重复执行")
 
-            row = conn.execute(
-                """SELECT symbol, currency, quantity, total_cost, updated_at
-                   FROM holdings WHERE platform_id=? AND group_id=?
+        row = conn.execute(
+            """SELECT symbol, currency, quantity, total_cost, updated_at
+               FROM holdings WHERE platform_id=? AND group_id=?
+               AND user_id=? AND symbol=?""",
+            scope,
+        ).fetchone()
+        old_quantity = int(row["quantity"]) if row else 0
+        old_cost = Decimal(row["total_cost"]) if row else Decimal("0")
+        if row and row["currency"] != currency:
+            raise ValueError("已有持仓币种不一致")
+
+        change = calculate_change(
+            action, old_quantity, old_cost, quantity, price
+        )
+
+        # Participant alias and the actual trade change commit together.
+        self._ensure_member(conn, actor, display_name, now)
+
+        if change.quantity_after:
+            conn.execute(
+                """INSERT INTO holdings (
+                    platform_id, group_id, user_id, symbol, currency,
+                    quantity, total_cost, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (platform_id, group_id, user_id, symbol)
+                DO UPDATE SET
+                    currency=excluded.currency,
+                    quantity=excluded.quantity,
+                    total_cost=excluded.total_cost,
+                    updated_at=excluded.updated_at""",
+                (*scope, currency, change.quantity_after,
+                 str(change.cost_after), now),
+            )
+            holding = Holding(
+                symbol, currency, change.quantity_after, change.cost_after, now
+            )
+        else:
+            conn.execute(
+                """DELETE FROM holdings WHERE platform_id=? AND group_id=?
                    AND user_id=? AND symbol=?""",
                 scope,
-            ).fetchone()
-            old_quantity = int(row["quantity"]) if row else 0
-            old_cost = Decimal(row["total_cost"]) if row else Decimal("0")
-            if row and row["currency"] != currency:
-                raise ValueError("已有持仓币种不一致")
-
-            change = calculate_change(
-                action, old_quantity, old_cost, quantity, price
             )
+            holding = None
 
-            # Participant alias and the actual trade change commit together.
-            self._ensure_member(conn, actor, display_name, now)
-
-            if change.quantity_after:
-                conn.execute(
-                    """INSERT INTO holdings (
-                        platform_id, group_id, user_id, symbol, currency,
-                        quantity, total_cost, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (platform_id, group_id, user_id, symbol)
-                    DO UPDATE SET
-                        currency=excluded.currency,
-                        quantity=excluded.quantity,
-                        total_cost=excluded.total_cost,
-                        updated_at=excluded.updated_at""",
-                    (*scope, currency, change.quantity_after,
-                     str(change.cost_after), now),
-                )
-                holding = Holding(
-                    symbol, currency, change.quantity_after, change.cost_after, now
-                )
-            else:
-                conn.execute(
-                    """DELETE FROM holdings WHERE platform_id=? AND group_id=?
-                       AND user_id=? AND symbol=?""",
-                    scope,
-                )
-                holding = None
-
-            conn.execute(
-                """INSERT INTO trades (
-                    id, platform_id, group_id, user_id, symbol, currency,
-                    action, quantity, unit_price, realized_pnl, quantity_after,
-                    cost_after, source_message_id, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid4()), *scope, currency, action, quantity,
-                 str(price), str(change.realized_pnl),
-                 change.quantity_after, str(change.cost_after),
-                 message_id, now),
-            )
-
+        conn.execute(
+            """INSERT INTO trades (
+                id, platform_id, group_id, user_id, symbol, currency,
+                action, quantity, unit_price, realized_pnl, quantity_after,
+                cost_after, source_message_id, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (str(uuid4()), *scope, currency, action, quantity,
+             str(price), str(change.realized_pnl),
+             change.quantity_after, str(change.cost_after),
+             message_id, now),
+        )
         return WriteResult(symbol, currency, action, holding, change.realized_pnl)
+
+    @staticmethod
+    def _snapshot(conn: sqlite3.Connection, actor: Owner, symbol: str):
+        return conn.execute(
+            """SELECT quantity, total_cost, updated_at FROM holdings
+               WHERE platform_id=? AND group_id=? AND user_id=? AND symbol=?""",
+            (actor.platform_id, actor.group_id, actor.user_id, symbol),
+        ).fetchone()
+
+    def create_draft(
+        self, actor: Owner, source_message_id: str, parsed: ParsedAction,
+        ttl_seconds: int = 300,
+    ) -> DraftPreview:
+        """Create ONE pending proposal per user, within current group, with snapshot."""
+        if not all((actor.platform_id, actor.group_id, actor.user_id)):
+            raise ValueError("无法识别发送者身份")
+        message_id = str(source_message_id or "").strip()
+        if not message_id:
+            raise ValueError("缺少消息 ID，不能创建待确认记录")
+        if not 30 <= ttl_seconds <= 3600:
+            raise ValueError("确认有效期设置无效")
+        now = datetime.now(timezone.utc)
+        created_at = now.isoformat(timespec="microseconds")
+        expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat(timespec="microseconds")
+        scope = (actor.platform_id, actor.group_id, actor.user_id)
+        with self.transaction() as conn:
+            old = conn.execute(
+                """SELECT original_message_id FROM pending_actions WHERE
+                   platform_id=? AND group_id=? AND user_id=?""",
+                scope,
+            ).fetchone()
+            if old is not None and old["original_message_id"] == message_id:
+                raise DuplicateMessageError("这条自然语言消息已经生成过确认请求")
+            row = self._snapshot(conn, actor, parsed.symbol)
+            old_quantity = int(row['quantity']) if row else 0
+            old_cost = Decimal(row['total_cost']) if row else Decimal('0')
+            old_updated = str(row['updated_at']) if row else ''
+            change = calculate_change(
+                parsed.action, old_quantity, old_cost, parsed.quantity, parsed.unit_price,
+            )
+            # Persist seen source IDs even AFTER a successful confirmation.
+            # A redelivery of the original /解析 message must not create a new draft.
+            try:
+                conn.execute(
+                    """INSERT INTO seen_parse_requests
+                       (platform_id, group_id, source_message_id, user_id)
+                       VALUES (?, ?, ?, ?)""",
+                    (actor.platform_id, actor.group_id, message_id, actor.user_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DuplicateMessageError("这条自然语言消息此前已经生成过草稿") from exc
+            conn.execute(
+                """DELETE FROM pending_actions WHERE
+                   platform_id=? AND group_id=? AND user_id=?""",
+                scope,
+            )
+            token = token_hex(5).upper()
+            conn.execute(
+                """INSERT INTO pending_actions
+                   (platform_id, group_id, user_id, token, action, symbol,
+                    currency, quantity, unit_price, original_message_id,
+                    expected_quantity, expected_cost, expected_updated_at,
+                    created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (*scope, token, parsed.action, parsed.symbol, parsed.currency,
+                 parsed.quantity, str(parsed.unit_price), message_id,
+                 old_quantity, str(old_cost), old_updated, created_at, expires_at),
+            )
+        return DraftPreview(
+            token, parsed.action, parsed.symbol, parsed.currency, parsed.quantity,
+            parsed.unit_price, change.quantity_after, change.cost_after,
+            change.realized_pnl, expires_at,
+        )
+
+    def confirm_draft(
+        self, actor: Owner, token: str, confirm_message_id: str,
+        display_name: str = "",
+    ) -> WriteResult:
+        """Only message sender can confirm. Recheck snapshot + time in same transaction."""
+        scope = (actor.platform_id, actor.group_id, actor.user_id)
+        if not all(scope):
+            raise ValueError("无法识别发送者身份")
+        if not str(confirm_message_id or '').strip():
+            raise ValueError("确认消息缺少 ID")
+        with self.transaction() as conn:
+            # Check confirm event idempotency before touching pending proposal.
+            used = conn.execute(
+                """SELECT 1 FROM trades WHERE platform_id=? AND group_id=?
+                   AND source_message_id=?""",
+                (actor.platform_id, actor.group_id, str(confirm_message_id)),
+            ).fetchone()
+            if used:
+                raise DuplicateMessageError("该确认消息已经记账")
+            draft = conn.execute(
+                """SELECT * FROM pending_actions WHERE
+                   platform_id=? AND group_id=? AND user_id=?""",
+                scope,
+            ).fetchone()
+            if draft is None:
+                raise ValueError("没有待确认操作，请先使用 /持仓 解析")
+            if str(token or '').strip().upper() != draft['token']:
+                raise ValueError("确认码不正确，未修改持仓")
+            if datetime.fromisoformat(draft['expires_at']) <= datetime.now(timezone.utc):
+                conn.execute(
+                    """DELETE FROM pending_actions WHERE
+                       platform_id=? AND group_id=? AND user_id=?""", scope,
+                )
+                raise ValueError("确认码已过期，请重新解析")
+            current = self._snapshot(conn, actor, draft['symbol'])
+            actual_qty = int(current['quantity']) if current else 0
+            actual_cost = str(current['total_cost']) if current else '0'
+            actual_updated = str(current['updated_at']) if current else ''
+            if (actual_qty != draft['expected_quantity'] or
+                    Decimal(actual_cost) != Decimal(draft['expected_cost']) or
+                    actual_updated != draft['expected_updated_at']):
+                raise ValueError("持仓已经发生变化，旧草稿已失效，请重新解析")
+            # Delete + write in ONE transaction, no awaited or external operations.
+            conn.execute(
+                """DELETE FROM pending_actions WHERE
+                   platform_id=? AND group_id=? AND user_id=?""", scope,
+            )
+            return self._apply_trade_tx(
+                conn, actor, confirm_message_id, draft['action'], draft['symbol'],
+                draft['quantity'], draft['unit_price'], display_name,
+            )
+
+    def cancel_draft(self, actor: Owner, token: str) -> bool:
+        scope = (actor.platform_id, actor.group_id, actor.user_id)
+        if not all(scope):
+            raise ValueError("无法识别发送者身份")
+        with self.transaction() as conn:
+            result = conn.execute(
+                """DELETE FROM pending_actions WHERE platform_id=? AND group_id=?
+                   AND user_id=? AND token=?""",
+                (*scope, str(token or '').strip().upper()),
+            )
+            return result.rowcount == 1

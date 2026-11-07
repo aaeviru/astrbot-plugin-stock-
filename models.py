@@ -64,3 +64,17 @@ class GroupPosition:
     @property
     def average_cost(self) -> Decimal:
         return self.total_cost / self.quantity
+
+
+@dataclass(frozen=True)
+class DraftPreview:
+    token: str
+    action: str
+    symbol: str
+    currency: str
+    quantity: int
+    unit_price: Decimal
+    quantity_after: int
+    cost_after: Decimal
+    realized_pnl: Decimal
+    expires_at: str
