@@ -34,6 +34,7 @@ class Trade:
     quantity_after: int
     cost_after: Decimal
     recorded_at: str
+    is_active: bool = True
 
 
 @dataclass(frozen=True)
@@ -64,3 +65,11 @@ class GroupPosition:
     @property
     def average_cost(self) -> Decimal:
         return self.total_cost / self.quantity
+
+
+@dataclass(frozen=True)
+class ToggleResult:
+    symbol: str
+    currency: str
+    now_active: bool
+    holding: Holding | None

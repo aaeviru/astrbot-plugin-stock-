@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 from decimal import Decimal, ROUND_HALF_UP
@@ -5,9 +6,11 @@ from decimal import Decimal, ROUND_HALF_UP
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.star.filter.command import GreedyStr
 
 from .identity import get_actor, resolve_read_target
 from .repositories.sqlite import DuplicateMessageError, SqliteRepository
+from .services.natural_language import SYSTEM_PROMPT, parse_model_response, reject_uncertain_intent
 
 
 def money(value: Decimal) -> str:
@@ -53,12 +56,16 @@ class PortfolioPlugin(Star):
             logger.exception("Portfolio: 写入失败")
             return "数据库写入失败，未完成本次操作，请联系管理员检查日志"
 
+        return self._format_write_result(result)
+
+    @staticmethod
+    def _format_write_result(result) -> str:
         holding = result.holding
         if holding is None:
             result_text = f"{result.symbol} 已清仓，操作记录已保留"
             if result.action == "SELL":
                 result_text += f"\n本次已实现盈亏：{money(result.realized_pnl)}"
-            return result_text
+            return result_text + "\n如有输入错误：/持仓 撤回"
 
         status = {"SET": "持仓已校准", "BUY": "买入已记录",
                   "SELL": "卖出已记录"}[result.action]
@@ -71,7 +78,7 @@ class PortfolioPlugin(Star):
         )
         if result.action == "SELL":
             detail += f"\n本次已实现盈亏：{money(result.realized_pnl)}"
-        return detail
+        return detail + "\n如有输入错误：/持仓 撤回"
 
     @filter.command_group("持仓")
     def portfolio(self):
@@ -239,6 +246,7 @@ class PortfolioPlugin(Star):
                 f"{trade.recorded_at[:16]} "
                 f"{labels[trade.action]} {trade.symbol} "
                 f"{trade.quantity} 股 @{trade.unit_price}"
+                + (" [已撤回]" if not trade.is_active else "")
             )
         yield event.plain_result("\n".join(lines))
 
@@ -257,6 +265,106 @@ class PortfolioPlugin(Star):
             f"本群登记编号：{'#' + str(member_no) if member_no else '尚未登记'}"
         )
 
+    @portfolio.command("记")
+    async def parse_natural(self, event: AstrMessageEvent, text: GreedyStr):
+        """仅显式命令触发一次 AI 解析；校验通过后直接记账。"""
+        if self.repo is None:
+            yield event.plain_result("持仓数据库尚未初始化")
+            return
+        try:
+            actor = get_actor(event)
+            message_id = str(
+                getattr(event.message_obj, "message_id", "") or ""
+            ).strip()
+            if not message_id:
+                raise ValueError("消息没有稳定的 ID，无法安全记账")
+            source = str(text or "").strip()
+            if not 4 <= len(source) <= 240:
+                raise ValueError("请提供 4～240 字的单笔买卖或持仓描述")
+            reject_uncertain_intent(source)
+            # Short-circuit already processed messages before paying for another LLM call.
+            if self.repo.message_was_processed(actor, message_id):
+                raise DuplicateMessageError("这条消息已处理过，不会重复记账")
+        except DuplicateMessageError as exc:
+            yield event.plain_result(str(exc))
+            return
+        except ValueError as exc:
+            yield event.plain_result(f"无法记账：{exc}")
+            return
+
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(
+                event.unified_msg_origin
+            )
+            if not provider_id:
+                yield event.plain_result("当前会话未配置聊天模型，请配置后重试")
+                return
+            response = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                system_prompt=SYSTEM_PROMPT,
+                prompt="请解析以下用户消息，只返回规定的 JSON：\n"
+                       + json.dumps({"text": source}, ensure_ascii=False),
+            )
+            parsed = parse_model_response(response.completion_text)
+        except ValueError as exc:
+            yield event.plain_result(f"无法记账：{exc}")
+            return
+        except Exception:
+            logger.exception("Portfolio: LLM 解析请求失败")
+            yield event.plain_result("模型服务不可用，未记账；可使用标准买卖指令")
+            return
+
+        try:
+            result = self.repo.apply_trade(
+                actor, message_id, parsed.action, parsed.symbol,
+                parsed.quantity, str(parsed.unit_price),
+                display_name=event.get_sender_name(),
+            )
+        except DuplicateMessageError as exc:
+            yield event.plain_result(str(exc))
+            return
+        except ValueError as exc:
+            yield event.plain_result(f"无法记账：{exc}")
+            return
+        except (sqlite3.Error, ArithmeticError):
+            logger.exception("Portfolio: AI 解析结果写入失败")
+            yield event.plain_result("数据库写入失败，未完成记账")
+            return
+        yield event.plain_result(self._format_write_result(result))
+
+    @portfolio.command("撤回")
+    async def toggle_latest(self, event: AstrMessageEvent):
+        """切换本人当前群最近一次成功输入，不需要编号或确认。"""
+        if self.repo is None:
+            yield event.plain_result("持仓数据库尚未初始化")
+            return
+        try:
+            actor = get_actor(event)
+            message_id = str(
+                getattr(event.message_obj, "message_id", "") or ""
+            ).strip()
+            result = self.repo.toggle_latest(actor, message_id)
+        except (DuplicateMessageError, ValueError) as exc:
+            yield event.plain_result(f"撤回失败：{exc}")
+            return
+        except (sqlite3.Error, ArithmeticError):
+            logger.exception("Portfolio: 撤回切换失败")
+            yield event.plain_result("数据库操作失败，持仓未改变")
+            return
+
+        title = ("已恢复最新输入" if result.now_active else "已撤回最新输入")
+        if result.holding is None:
+            detail = "当前该股票没有持仓"
+        else:
+            detail = (
+                f"当前数量：{result.holding.quantity} 股\n"
+                f"平均成本：{money(result.holding.average_cost)} {result.currency}"
+            )
+        yield event.plain_result(
+            f"{title}\n{result.symbol}\n{detail}\n"
+            "再次发送 /持仓 撤回 可切换回来"
+        )
+
     @portfolio.command("帮助")
     async def help(self, event: AstrMessageEvent):
         yield event.plain_result(
@@ -268,5 +376,7 @@ class PortfolioPlugin(Star):
             "/持仓 汇总 [页码]\n"
             "/持仓 历史\n"
             "/持仓 身份\n"
+            "/持仓 记 今天165.7买了200股NTT（立即记账）\n"
+            "/持仓 撤回（撤销/恢复本人最后一笔输入）\n"
             "SET 用于校准；买卖用于记录真实交易；仅本人可更改。"
         )

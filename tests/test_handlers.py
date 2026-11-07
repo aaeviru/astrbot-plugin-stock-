@@ -45,6 +45,7 @@ class FakeEvent:
         )
         self.nickname = nickname
         self.self_id = self_id
+        self.unified_msg_origin = f'qq-1:{group}:{user}'
 
     def get_platform_id(self):
         return 'qq-1'
@@ -79,6 +80,14 @@ class AstrBotHandlersOfflineTests(unittest.TestCase):
         event = types.ModuleType('astrbot.api.event')
         star = types.ModuleType('astrbot.api.star')
         comp = types.ModuleType('astrbot.api.message_components')
+        core = types.ModuleType('astrbot.core')
+        core_star = types.ModuleType('astrbot.core.star')
+        core_filter = types.ModuleType('astrbot.core.star.filter')
+        core_cmd = types.ModuleType('astrbot.core.star.filter.command')
+        core.__path__ = []
+        core_star.__path__ = []
+        core_filter.__path__ = []
+        core_cmd.GreedyStr = str
         api.__path__ = []
         astrbot.__path__ = []
         api.logger = logging.getLogger('astrbot-test')
@@ -94,6 +103,10 @@ class AstrBotHandlersOfflineTests(unittest.TestCase):
             'astrbot.api.event': event,
             'astrbot.api.star': star,
             'astrbot.api.message_components': comp,
+            'astrbot.core': core,
+            'astrbot.core.star': core_star,
+            'astrbot.core.star.filter': core_filter,
+            'astrbot.core.star.filter.command': core_cmd,
         }
         cls._patch = patch.dict(sys.modules, cls._shims)
         cls._patch.start()

@@ -128,7 +128,7 @@ class GroupPublicReadTests(unittest.TestCase):
         conn.execute('PRAGMA user_version = 1')
         conn.close()
         self.repo.open()
-        self.assertEqual(self.repo.conn.execute('PRAGMA user_version').fetchone()[0], 2)
+        self.assertEqual(self.repo.conn.execute('PRAGMA user_version').fetchone()[0], 4)
         self.assertEqual(self.repo.get_member_no(self.a), 1)
         self.assertEqual(self.repo.get_member_no(self.b), 2)
         self.assertEqual(self.repo.get_holdings(self.a)[0].quantity, 100)
