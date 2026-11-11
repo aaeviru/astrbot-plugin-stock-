@@ -1,7 +1,7 @@
 name: astrbot_plugin_portfolio
 display_name: 群友持仓记录
 desc: 按群与用户隔离的持仓记账插件，本人修改、群内公开查询
-version: v0.5.0
+version: v0.6.0
 author: aaeviru
 repo: https://github.com/aaeviru/astrbot_plugin_portfolio
 support_platforms:

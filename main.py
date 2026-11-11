@@ -40,6 +40,10 @@ class PortfolioPlugin(Star):
             self.repo = None
         logger.info("Portfolio: SQLite 已关闭")
 
+    @staticmethod
+    def _quote_title(quote) -> str:
+        return f"{quote.trade_date} 收盘价" if quote.trade_date else "最新可用价"
+
     def _write(self, event: AstrMessageEvent,
                action: str, symbol: str, quantity: int, price: str) -> str:
         if self.repo is None:
@@ -65,7 +69,7 @@ class PortfolioPlugin(Star):
     def _format_write_result(result) -> str:
         holding = result.holding
         if holding is None:
-            result_text = f"{result.symbol} 已清仓，操作记录已保留"
+            result_text = f"✅ {result.symbol} 已清仓，操作记录已保留"
             if result.action == "SELL":
                 result_text += f"\n本次已实现盈亏：{money(result.realized_pnl)}"
             return result_text + "\n如有输入错误：/持仓 撤回"
@@ -81,7 +85,7 @@ class PortfolioPlugin(Star):
         )
         if result.action == "SELL":
             detail += f"\n本次已实现盈亏：{money(result.realized_pnl)}"
-        return detail + "\n如有输入错误：/持仓 撤回"
+        return "✅ " + detail + "\n↩️ 有误可发送 /持仓 撤回"
 
     @filter.command_group("持仓")
     def portfolio(self):
@@ -147,11 +151,11 @@ class PortfolioPlugin(Star):
             yield event.plain_result("数据库查询失败")
             return
 
-        lines = [f"本群有持仓的登记用户：{total} 人（第 {page}/{pages} 页）"]
+        lines = [f"👥 本群持仓成员 · {total} 人（第 {page}/{pages} 页）", ""]
         for member in members:
             name = member.display_name or f"用户 {member.user_id}"
-            lines.append(f"#{member.member_no} {name}：{member.holding_count} 只股票")
-        lines.append("查询：/持仓 查看 #编号")
+            lines.append(f"#{member.member_no} · {name}（{member.holding_count} 只）")
+        lines.append("\n🔎 查询：/持仓 查看 #编号")
         yield event.plain_result("\n".join(lines))
 
     @portfolio.command("汇总")
@@ -181,7 +185,7 @@ class PortfolioPlugin(Star):
             return
 
         lines = [
-            f"本群持仓汇总：{members} 人、{len(positions)} 种股票（第 {page}/{pages} 页）"
+            f"📊 本群持仓汇总 · {members} 人 / {len(positions)} 种股票（第 {page}/{pages} 页）"
         ]
         quotes = await self.quotes.fetch_many([p.symbol for p in items])
         total_cost_cny = total_value_cny = Decimal("0")
@@ -191,9 +195,8 @@ class PortfolioPlugin(Star):
         fetched_at = ""
         for position in items:
             lines.append(
-                f"{position.symbol}：{position.holder_count} 人 / "
-                f"{position.quantity} 股 / "
-                f"群加权成本 {money(position.average_cost)} {position.currency}"
+                f"\n▎{position.symbol} · {position.holder_count} 人 / {position.quantity} 股\n"
+                f"  群加权成本 {money(position.average_cost)} {position.currency}"
             )
             lines.append(
                 f"  摊薄成本 {money(diluted_average_cost(position.quantity, position.total_cost, position.realized_pnl))} {position.currency}"
@@ -203,18 +206,17 @@ class PortfolioPlugin(Star):
             if position.currency == "CNY":
                 all_cny += 1
             if lookup.quote is None:
-                lines.append(f"  行情：{lookup.reason}；综合盈亏暂不可计算")
+                lines.append("  ⚠️ 行情暂不可用；综合盈亏暂不可计算")
                 continue
             value, pnl, rate = compute_valuation(
                 position.quantity, position.total_cost, lookup.quote
             )
             fetched_at = lookup.quote.fetched_at
             lines.append(
-                f"  最新可用价 {lookup.quote.price} {position.currency} | "
-                f"市值 {money(value)} | 浮盈亏 {signed_money(pnl)} "
-                f"({signed_percent(rate)})"
+                f"  {self._quote_title(lookup.quote)} {lookup.quote.price} {position.currency} | 市值 {money(value)}\n"
+                f"  浮盈亏 {signed_money(pnl)} ({signed_percent(rate)})"
             )
-            lines.append(f"  综合盈亏 {signed_money(pnl + position.realized_pnl)} {position.currency}")
+            lines.append(f"  ⭐ 综合盈亏 {signed_money(pnl + position.realized_pnl)} {position.currency}")
             if position.currency == "CNY":
                 total_cost_cny += position.total_cost
                 total_value_cny += value
@@ -225,14 +227,14 @@ class PortfolioPlugin(Star):
             label = "全部" if priced_cny == all_cny else "部分"
             rate = diff / total_cost_cny * 100 if total_cost_cny else None
             lines.append(
-                f"本页已报价 A 股{label}小计：市值 {money(total_value_cny)} CNY / "
+                f"\n💰 本页已报价 A 股{label}小计\n市值 {money(total_value_cny)} CNY / "
                 f"浮盈亏 {signed_money(diff)} CNY ({signed_percent(rate)}) / "
                 f"周期已实现 {signed_money(realized_cny)} CNY / "
                 f"综合盈亏 {signed_money(diff + realized_cny)} CNY"
             )
         if fetched_at:
-            lines.append(f"报价来源：AKShare / 东方财富；抓取于 {fetched_at}")
-        lines.append("行情仅 A 股；AKShare 报价可能延迟或停留在最近交易日，不代表当前可成交价。")
+            lines.append(f"🕒 行情抓取于 {fetched_at}")
+        lines.append("注：仅 A 股行情；腾讯备用源显示最近收盘价，不代表实时价。")
         yield event.plain_result("\n".join(lines))
 
     @portfolio.command("查看")
@@ -259,7 +261,7 @@ class PortfolioPlugin(Star):
             return
 
         quotes = await self.quotes.fetch_many([h.symbol for h in holdings])
-        lines = [f"{target_label} 的公开持仓："]
+        lines = [f"📊 {target_label} 的公开持仓"]
         total_cost_cny = total_value_cny = Decimal("0")
         realized_cny = Decimal("0")
         priced_cny = 0
@@ -267,8 +269,8 @@ class PortfolioPlugin(Star):
         fetched_at = ""
         for h in holdings:
             lines.append(
-                f"{h.symbol}：{h.quantity} 股 / "
-                f"成本 {money(h.average_cost)} {h.currency}"
+                f"\n▎{h.symbol} · {h.quantity} 股\n"
+                f"  成本 {money(h.average_cost)} {h.currency}"
             )
             cycle_realized = realized_by_symbol.get(h.symbol, Decimal("0"))
             lines.append(
@@ -279,18 +281,17 @@ class PortfolioPlugin(Star):
                 all_cny += 1
             lookup = quotes[h.symbol]
             if lookup.quote is None:
-                lines.append(f"  行情：{lookup.reason}；综合盈亏暂不可计算")
+                lines.append("  ⚠️ 行情暂不可用；综合盈亏暂不可计算")
                 continue
             value, pnl, rate = compute_valuation(
                 h.quantity, h.total_cost, lookup.quote
             )
             fetched_at = lookup.quote.fetched_at
             lines.append(
-                f"  最新可用价 {lookup.quote.price} {h.currency} | "
-                f"市值 {money(value)} | 浮盈亏 {signed_money(pnl)} "
-                f"({signed_percent(rate)})"
+                f"  {self._quote_title(lookup.quote)} {lookup.quote.price} {h.currency} | 市值 {money(value)}\n"
+                f"  浮盈亏 {signed_money(pnl)} ({signed_percent(rate)})"
             )
-            lines.append(f"  综合盈亏 {signed_money(pnl + cycle_realized)} {h.currency}")
+            lines.append(f"  ⭐ 综合盈亏 {signed_money(pnl + cycle_realized)} {h.currency}")
             if h.currency == "CNY":
                 total_cost_cny += h.total_cost
                 total_value_cny += value
@@ -301,14 +302,14 @@ class PortfolioPlugin(Star):
             label = "全部" if priced_cny == all_cny else "部分"
             rate = diff / total_cost_cny * 100 if total_cost_cny else None
             lines.append(
-                f"已报价 A 股{label}小计：市值 {money(total_value_cny)} CNY / "
+                f"\n💰 已报价 A 股{label}小计\n市值 {money(total_value_cny)} CNY / "
                 f"浮盈亏 {signed_money(diff)} CNY ({signed_percent(rate)}) / "
                 f"周期已实现 {signed_money(realized_cny)} CNY / "
                 f"综合盈亏 {signed_money(diff + realized_cny)} CNY"
             )
         if fetched_at:
-            lines.append(f"报价来源：AKShare / 东方财富；抓取于 {fetched_at}")
-        lines.append("行情可能延迟，休市时为最近可用价；抓取时间不等于交易所报价时间。")
+            lines.append(f"🕒 行情抓取于 {fetched_at}")
+        lines.append("注：行情可能延迟；收盘价注明交易日。")
         yield event.plain_result("\n".join(lines))
 
     @portfolio.command("历史")
@@ -332,7 +333,7 @@ class PortfolioPlugin(Star):
             return
 
         labels = {"SET": "设置", "BUY": "买入", "SELL": "卖出"}
-        lines = ["你最近的操作（时间为 UTC）："]
+        lines = ["🧾 最近操作（UTC，仅本人可见）", ""]
         for trade in trades:
             lines.append(
                 f"{trade.recorded_at[:16]} "
@@ -453,7 +454,7 @@ class PortfolioPlugin(Star):
                 f"平均成本：{money(result.holding.average_cost)} {result.currency}"
             )
         yield event.plain_result(
-            f"{title}\n{result.symbol}\n{detail}\n"
+            f"↩️ {title}\n{result.symbol}\n{detail}\n"
             "再次发送 /持仓 撤回 可切换回来"
         )
 

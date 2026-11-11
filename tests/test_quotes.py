@@ -126,7 +126,7 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         mcp.response = sample_response()
         result2 = await service.fetch_many(['600519.SH'])
         self.assertEqual(result2['600519.SH'].quote.price, Decimal('1600.50'))
-        self.assertEqual(len(mcp.calls), 2)
+        self.assertEqual(len(mcp.calls), 3)  # primary + fallback failure, then success
 
     async def test_other_mcp_server_cannot_be_mistaken_for_aktools(self):
         service = AktoolsQuoteService(MCPContext(FakeMCP(), server='unrelated'))
@@ -189,14 +189,14 @@ class QuoteHandlerTests(unittest.TestCase):
         self.call(self.plugin.set_holding(FakeEvent('A', 'g1', 'set1'), '9432.T', 100, '150'))
         reply = self.call(self.plugin.view(FakeEvent('A', 'g1', 'view1')))
         self.assertIn('成本 150.00 JPY', reply)
-        self.assertIn('暂未接入', reply)
+        self.assertIn('行情暂不可用', reply)
         self.assertEqual(self.mcp.calls, [])
 
     def test_unavailable_quote_never_alters_holdings(self):
         self.call(self.plugin.set_holding(FakeEvent('A', 'g1', 'set1'), '600519.SH', 100, '1500'))
         self.plugin.quotes = AktoolsQuoteService(None)
         reply = self.call(self.plugin.view(FakeEvent('A', 'g1', 'view1')))
-        self.assertIn('AKShare MCP 未连接', reply)
+        self.assertIn('行情暂不可用', reply)
         self.assertEqual(self.repo.get_holdings(self.owner)[0].quantity, 100)
 
     def test_cross_group_query_cannot_value_other_group(self):

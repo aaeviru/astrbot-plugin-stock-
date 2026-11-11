@@ -1,6 +1,6 @@
 """Read-only AKTools MCP quote adapter; it never modifies the holdings ledger.
 
-This deliberately supports *A shares only* in v0.4.0. Other markets do not
+This deliberately supports *A shares only* in v0.6.0. Other markets do not
 share AKShare's source latency, timestamp or coverage guarantees.
 """
 
@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
@@ -20,6 +21,9 @@ SHARE_CODE = re.compile(r"(?P<code>[0-9]{6})\.(?:SH|SZ)\Z")
 MAX_QUOTE_FETCHES = 8
 CACHE_SECONDS = 90
 FETCH_TIMEOUT_SECONDS = 12
+LOOKBACK_DAYS = 40
+CHINA_TZ = timezone(timedelta(hours=8))
+LOG = logging.getLogger(__name__)
 
 
 class QuoteUnavailable(Exception):
@@ -33,6 +37,8 @@ class Quote:
     currency: str
     source: str
     fetched_at: str  # UTC retrieval time; NOT exchange market time
+    price_kind: str = "最新可用价"
+    trade_date: str | None = None  # For Tencent daily-close fallback
 
 
 @dataclass(frozen=True)
@@ -54,7 +60,11 @@ def _to_mapping(payload: Any) -> dict:
 
 def _unpack_mcp_response(response: Any) -> dict:
     if getattr(response, "isError", False):
-        raise QuoteUnavailable("AKShare 数据源返回错误")
+        error_text = " ".join(
+            str(getattr(part, "text", "") or "")
+            for part in (getattr(response, "content", None) or [])
+        )
+        raise QuoteUnavailable("AKTools 工具错误：" + _safe_log_message(error_text))
     structured = getattr(response, "structuredContent", None)
     if isinstance(structured, dict):
         try:
@@ -99,6 +109,56 @@ def _extract_a_price(payload: dict, symbol: str) -> Decimal:
     return price
 
 
+def _safe_log_message(raw: str) -> str:
+    """Keep useful upstream errors in logs, redacting common secret patterns."""
+    value = str(raw or "未提供错误详情").replace("\n", " ").replace("\r", " ")
+    value = re.sub(r"https?://\S+", "[URL]", value)
+    value = re.sub(r"(?i)(Bearer\s+)\S+", r"\1[REDACTED]", value)
+    value = re.sub(r"(?i)((?:api[_-]?key|token|password)\s*[=:]\s*)\S+",
+                   r"\1[REDACTED]", value)
+    return value[:350]
+
+
+def _positive_price(raw: Any) -> Decimal:
+    if raw is None or type(raw) is bool:
+        raise QuoteUnavailable("行情没有有效价格")
+    try:
+        value = Decimal(str(raw))
+    except (ValueError, TypeError, InvalidOperation):
+        raise QuoteUnavailable("行情价格不是有效数字") from None
+    if not value.is_finite() or value <= 0 or value > Decimal("1000000000"):
+        raise QuoteUnavailable("行情价格异常")
+    return value
+
+
+def _extract_tx_close(payload: dict, symbol: str, today: date) -> tuple[Decimal, str]:
+    """Pick the newest valid Tencent daily close, never masquerading as a live tick."""
+    if payload.get("name") != "stock_zh_a_hist_tx":
+        raise QuoteUnavailable("备用行情接口返回的数据不匹配")
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not 0 < len(rows) <= 100:
+        raise QuoteUnavailable("备用行情没有日线记录")
+    latest: tuple[date, Decimal] | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_date = row.get("date")
+        if raw_date is None:
+            continue
+        try:
+            day = date.fromisoformat(str(raw_date)[:10])
+            if not today - timedelta(days=LOOKBACK_DAYS) <= day <= today:
+                continue
+            close = _positive_price(row.get("close"))
+        except (ValueError, QuoteUnavailable):
+            continue
+        if latest is None or day > latest[0]:
+            latest = (day, close)
+    if latest is None:
+        raise QuoteUnavailable("备用行情没有最近的有效收盘价")
+    return latest[1], latest[0].isoformat()
+
+
 class AktoolsQuoteService:
     """Reuse active AstrBot AKTools MCP client (no second AKShare install).
 
@@ -129,6 +189,28 @@ class AktoolsQuoteService:
                 return client
         raise QuoteUnavailable("没有找到已连接的 AKTools MCP（get_data 工具）")
 
+    async def _read_data(self, client: Any, name: str,
+                         params: dict[str, str],
+                         max_rows: int, offset: int = 0) -> dict:
+        try:
+            response = await asyncio.wait_for(
+                client.call_tool_with_reconnect(
+                    tool_name="get_data",
+                    arguments={
+                        "name": name, "params": params,
+                        "max_rows": max_rows, "offset": offset,
+                    },
+                    read_timeout_seconds=timedelta(seconds=FETCH_TIMEOUT_SECONDS),
+                ),
+                timeout=FETCH_TIMEOUT_SECONDS + 2,
+            )
+        except Exception as exc:
+            raise QuoteUnavailable(
+                f"{name} 的 MCP 请求失败 ({type(exc).__name__}: "
+                f"{_safe_log_message(str(exc))})"
+            ) from exc
+        return _unpack_mcp_response(response)
+
     async def get_quote(self, symbol: str) -> Quote:
         match = SHARE_CODE.fullmatch(symbol)
         if match is None:
@@ -144,31 +226,50 @@ class AktoolsQuoteService:
             return cached[1]
 
         client = self._get_aktools_client()
-        # AKShare reads this six-digit code, not the .SH / .SZ suffix.
         try:
-            response = await asyncio.wait_for(
-                client.call_tool_with_reconnect(
-                    tool_name="get_data",
-                    arguments={
-                        "name": "stock_individual_info_em",
-                        "params": {"symbol": match.group("code")},
-                        "max_rows": 30,
-                        "offset": 0,
-                    },
-                    read_timeout_seconds=timedelta(seconds=FETCH_TIMEOUT_SECONDS),
-                ),
-                timeout=FETCH_TIMEOUT_SECONDS + 2,
+            data = await self._read_data(
+                client, "stock_individual_info_em", {"symbol": code}, 30,
             )
-        except Exception as exc:
-            # No raw remote errors in QQ replies. They may contain tokens/URLs.
-            raise QuoteUnavailable("AKShare 行情请求超时或失败") from exc
-        data = _unpack_mcp_response(response)
-        price = _extract_a_price(data, symbol)
-        quote = Quote(
-            symbol=symbol, price=price, currency="CNY",
-            source="AKShare / 东方财富",
-            fetched_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        )
+            price = _extract_a_price(data, symbol)
+            quote = Quote(
+                symbol=symbol, price=price, currency="CNY",
+                source="AKShare / 东方财富",
+                fetched_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            )
+        except QuoteUnavailable as primary_error:
+            # push2 may return empty/HTML/rate-limited responses. Keep details
+            # in the server log, not the public QQ message.
+            LOG.warning(
+                "Portfolio: %s 东方财富报价失败，尝试腾讯日线：%s",
+                symbol, _safe_log_message(str(primary_error)),
+            )
+            today = datetime.now(CHINA_TZ).date()
+            prefix = "sh" if expected_exchange == "SH" else "sz"
+            try:
+                data = await self._read_data(
+                    client, "stock_zh_a_hist_tx",
+                    {
+                        "symbol": prefix + code,
+                        "start_date": (today - timedelta(days=LOOKBACK_DAYS)).strftime("%Y%m%d"),
+                        "end_date": today.strftime("%Y%m%d"),
+                        "adjust": "",
+                    },
+                    max_rows=5, offset=-5,
+                )
+                price, trade_day = _extract_tx_close(data, symbol, today)
+            except QuoteUnavailable as backup_error:
+                LOG.warning(
+                    "Portfolio: %s 腾讯备用行情失败：%s",
+                    symbol, _safe_log_message(str(backup_error)),
+                )
+                raise QuoteUnavailable("主行情及备用行情均不可用") from backup_error
+            quote = Quote(
+                symbol=symbol, price=price, currency="CNY",
+                source="AKShare / 腾讯证券",
+                fetched_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                price_kind="最近收盘价",
+                trade_date=trade_day,
+            )
         self._cache[symbol] = (time.monotonic(), quote)
         return quote
 
