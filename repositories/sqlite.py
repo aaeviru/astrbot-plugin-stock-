@@ -324,6 +324,52 @@ class SqliteRepository:
         return [GroupMember(r['user_id'], r['member_no'],
                             r['display_name'], r['holding_count']) for r in rows]
 
+    def _active_cycle_realized(self, platform_id: str, group_id: str,
+                               user_id: str | None = None
+                               ) -> dict[tuple[str, str], Decimal]:
+        """Current-cycle realized P&L by (user, symbol), for *active holdings*.
+
+        Reads all active trade rows in insertion order, not get_history's
+        display-limited 10 rows. A SET or a full sale closes the previous
+        cycle. Inactive (undone) entries never reset or contribute.
+        """
+        params = [platform_id, group_id]
+        user_filter = ""
+        if user_id is not None:
+            user_filter = " AND t.user_id=?"
+            params.append(user_id)
+        rows = self._db().execute(
+            """SELECT t.user_id, t.symbol, t.action, t.quantity_after,
+                      t.realized_pnl
+               FROM trades AS t
+               JOIN holdings AS h
+                 ON t.platform_id=h.platform_id
+                AND t.group_id=h.group_id
+                AND t.user_id=h.user_id
+                AND t.symbol=h.symbol
+                AND t.currency=h.currency
+               WHERE t.platform_id=? AND t.group_id=? AND t.is_active=1
+            """ + user_filter + " ORDER BY t.rowid ASC",
+            params,
+        ).fetchall()
+        totals: dict[tuple[str, str], Decimal] = {}
+        for row in rows:
+            key = (row['user_id'], row['symbol'])
+            if row['action'] == 'SET' or (
+                    row['action'] == 'SELL' and row['quantity_after'] == 0):
+                totals[key] = Decimal('0')
+            elif row['action'] == 'SELL':
+                totals[key] = totals.get(key, Decimal('0')) + Decimal(row['realized_pnl'])
+        return totals
+
+    def get_period_realized_for_holdings(self, owner: Owner) -> dict[str, Decimal]:
+        """Public positions' cycle totals, without exposing the trade rows."""
+        data = self._active_cycle_realized(
+            owner.platform_id, owner.group_id, owner.user_id
+        )
+        return {symbol: pnl for (user_id, symbol), pnl in data.items()
+                if user_id == owner.user_id}
+
     def get_group_summary(self, actor: Owner) -> list[GroupPosition]:
         """Group-scoped aggregation in Python Decimal, NOT SUM(TEXT) in SQL."""
         rows = self._db().execute(
@@ -331,18 +377,26 @@ class SqliteRepository:
                FROM holdings WHERE platform_id=? AND group_id=?""",
             (actor.platform_id, actor.group_id),
         ).fetchall()
+        realized_by_user = self._active_cycle_realized(
+            actor.platform_id, actor.group_id
+        )
         groups: dict[tuple[str, str], dict] = {}
         for row in rows:
             key = (row['symbol'], row['currency'])
             if key not in groups:
                 groups[key] = {'users': set(), 'quantity': 0,
-                               'total_cost': Decimal('0')}
+                               'total_cost': Decimal('0'),
+                               'realized_pnl': Decimal('0')}
             groups[key]['users'].add(row['user_id'])
             groups[key]['quantity'] += row['quantity']
             groups[key]['total_cost'] += Decimal(row['total_cost'])
+            groups[key]['realized_pnl'] += realized_by_user.get(
+                (row['user_id'], row['symbol']), Decimal('0')
+            )
         result = [
             GroupPosition(symbol, currency, len(info['users']),
-                          info['quantity'], info['total_cost'])
+                          info['quantity'], info['total_cost'],
+                          info['realized_pnl'])
             for (symbol, currency), info in groups.items()
         ]
         return sorted(result, key=lambda r: (-r.holder_count, r.symbol, r.currency))
