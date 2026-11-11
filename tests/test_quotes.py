@@ -139,7 +139,7 @@ class QuoteServiceTests(unittest.IsolatedAsyncioTestCase):
         names = [f'{600000+i}.SH' for i in range(9)]
         out = await service.fetch_many(names)
         self.assertIn('8', out[names[-1]].reason)
-        self.assertEqual(len(mcp.calls), 8)
+        self.assertEqual(len(mcp.calls), 16)  # eight securities, primary + fallback each
 
 
 class QuoteHandlerTests(unittest.TestCase):
