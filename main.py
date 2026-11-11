@@ -206,7 +206,9 @@ class PortfolioPlugin(Star):
             if position.currency == "CNY":
                 all_cny += 1
             if lookup.quote is None:
-                lines.append("  ⚠️ 行情暂不可用；综合盈亏暂不可计算")
+                warning = ("股票代码后缀有误" if "后缀不符" in lookup.reason
+                           else "行情暂不可用")
+                lines.append(f"  ⚠️ {warning}；综合盈亏暂不可计算")
                 continue
             value, pnl, rate = compute_valuation(
                 position.quantity, position.total_cost, lookup.quote
@@ -281,7 +283,9 @@ class PortfolioPlugin(Star):
                 all_cny += 1
             lookup = quotes[h.symbol]
             if lookup.quote is None:
-                lines.append("  ⚠️ 行情暂不可用；综合盈亏暂不可计算")
+                warning = ("股票代码后缀有误" if "后缀不符" in lookup.reason
+                           else "行情暂不可用")
+                lines.append(f"  ⚠️ {warning}；综合盈亏暂不可计算")
                 continue
             value, pnl, rate = compute_valuation(
                 h.quantity, h.total_cost, lookup.quote

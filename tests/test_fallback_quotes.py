@@ -137,3 +137,12 @@ class FallbackHandlerTests(unittest.TestCase):
         self.assertIn("综合盈亏", reply)
         self.assertNotIn("东方财富返回空响应", reply)
         self.assertEqual(self.ctx.llm_calls, 0)
+
+
+    def test_invalid_exchange_suffix_is_not_hidden(self):
+        self.call(self.plugin.set_holding(
+            FakeEvent("A", "g1", "set-invalid"), "002158.SH", 100, "23.74"
+        ))
+        reply = self.call(self.plugin.view(FakeEvent("B", "g1", "view-invalid"), "#1"))
+        self.assertIn("股票代码后缀有误", reply)
+        self.assertEqual(len(self.mcp.calls), 0)
