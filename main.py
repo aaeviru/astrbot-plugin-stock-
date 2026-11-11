@@ -12,6 +12,7 @@ from .identity import get_actor, resolve_read_target
 from .repositories.sqlite import DuplicateMessageError, SqliteRepository
 from .services.natural_language import SYSTEM_PROMPT, parse_model_response, reject_uncertain_intent
 from .services.quotes import AktoolsQuoteService, compute_valuation, signed_money, signed_percent
+from .services.portfolio import diluted_average_cost
 
 
 def money(value: Decimal) -> str:
@@ -184,6 +185,7 @@ class PortfolioPlugin(Star):
         ]
         quotes = await self.quotes.fetch_many([p.symbol for p in items])
         total_cost_cny = total_value_cny = Decimal("0")
+        realized_cny = Decimal("0")
         priced_cny = 0
         all_cny = 0
         fetched_at = ""
@@ -193,11 +195,15 @@ class PortfolioPlugin(Star):
                 f"{position.quantity} 股 / "
                 f"群加权成本 {money(position.average_cost)} {position.currency}"
             )
+            lines.append(
+                f"  摊薄成本 {money(diluted_average_cost(position.quantity, position.total_cost, position.realized_pnl))} {position.currency}"
+                f" | 周期已实现 {signed_money(position.realized_pnl)} {position.currency}"
+            )
             lookup = quotes[position.symbol]
             if position.currency == "CNY":
                 all_cny += 1
             if lookup.quote is None:
-                lines.append(f"  行情：{lookup.reason}")
+                lines.append(f"  行情：{lookup.reason}；综合盈亏暂不可计算")
                 continue
             value, pnl, rate = compute_valuation(
                 position.quantity, position.total_cost, lookup.quote
@@ -208,9 +214,11 @@ class PortfolioPlugin(Star):
                 f"市值 {money(value)} | 浮盈亏 {signed_money(pnl)} "
                 f"({signed_percent(rate)})"
             )
+            lines.append(f"  综合盈亏 {signed_money(pnl + position.realized_pnl)} {position.currency}")
             if position.currency == "CNY":
                 total_cost_cny += position.total_cost
                 total_value_cny += value
+                realized_cny += position.realized_pnl
                 priced_cny += 1
         if priced_cny:
             diff = total_value_cny - total_cost_cny
@@ -218,7 +226,9 @@ class PortfolioPlugin(Star):
             rate = diff / total_cost_cny * 100 if total_cost_cny else None
             lines.append(
                 f"本页已报价 A 股{label}小计：市值 {money(total_value_cny)} CNY / "
-                f"浮盈亏 {signed_money(diff)} CNY ({signed_percent(rate)})"
+                f"浮盈亏 {signed_money(diff)} CNY ({signed_percent(rate)}) / "
+                f"周期已实现 {signed_money(realized_cny)} CNY / "
+                f"综合盈亏 {signed_money(diff + realized_cny)} CNY"
             )
         if fetched_at:
             lines.append(f"报价来源：AKShare / 东方财富；抓取于 {fetched_at}")
@@ -234,6 +244,7 @@ class PortfolioPlugin(Star):
             actor = get_actor(event)
             target = self._read_target(event, target_id, actor)
             holdings = self.repo.get_holdings(target)
+            realized_by_symbol = self.repo.get_period_realized_for_holdings(target)
             target_label = self.repo.get_member_label(target)
         except ValueError as exc:
             yield event.plain_result(f"查询失败：{exc}")
@@ -250,6 +261,7 @@ class PortfolioPlugin(Star):
         quotes = await self.quotes.fetch_many([h.symbol for h in holdings])
         lines = [f"{target_label} 的公开持仓："]
         total_cost_cny = total_value_cny = Decimal("0")
+        realized_cny = Decimal("0")
         priced_cny = 0
         all_cny = 0
         fetched_at = ""
@@ -258,11 +270,16 @@ class PortfolioPlugin(Star):
                 f"{h.symbol}：{h.quantity} 股 / "
                 f"成本 {money(h.average_cost)} {h.currency}"
             )
+            cycle_realized = realized_by_symbol.get(h.symbol, Decimal("0"))
+            lines.append(
+                f"  摊薄成本 {money(diluted_average_cost(h.quantity, h.total_cost, cycle_realized))} {h.currency}"
+                f" | 周期已实现 {signed_money(cycle_realized)} {h.currency}"
+            )
             if h.currency == "CNY":
                 all_cny += 1
             lookup = quotes[h.symbol]
             if lookup.quote is None:
-                lines.append(f"  行情：{lookup.reason}")
+                lines.append(f"  行情：{lookup.reason}；综合盈亏暂不可计算")
                 continue
             value, pnl, rate = compute_valuation(
                 h.quantity, h.total_cost, lookup.quote
@@ -273,9 +290,11 @@ class PortfolioPlugin(Star):
                 f"市值 {money(value)} | 浮盈亏 {signed_money(pnl)} "
                 f"({signed_percent(rate)})"
             )
+            lines.append(f"  综合盈亏 {signed_money(pnl + cycle_realized)} {h.currency}")
             if h.currency == "CNY":
                 total_cost_cny += h.total_cost
                 total_value_cny += value
+                realized_cny += cycle_realized
                 priced_cny += 1
         if priced_cny:
             diff = total_value_cny - total_cost_cny
@@ -283,7 +302,9 @@ class PortfolioPlugin(Star):
             rate = diff / total_cost_cny * 100 if total_cost_cny else None
             lines.append(
                 f"已报价 A 股{label}小计：市值 {money(total_value_cny)} CNY / "
-                f"浮盈亏 {signed_money(diff)} CNY ({signed_percent(rate)})"
+                f"浮盈亏 {signed_money(diff)} CNY ({signed_percent(rate)}) / "
+                f"周期已实现 {signed_money(realized_cny)} CNY / "
+                f"综合盈亏 {signed_money(diff + realized_cny)} CNY"
             )
         if fetched_at:
             lines.append(f"报价来源：AKShare / 东方财富；抓取于 {fetched_at}")

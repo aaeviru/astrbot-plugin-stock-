@@ -61,6 +61,7 @@ class GroupPosition:
     holder_count: int
     quantity: int
     total_cost: Decimal
+    realized_pnl: Decimal = Decimal("0")
 
     @property
     def average_cost(self) -> Decimal:

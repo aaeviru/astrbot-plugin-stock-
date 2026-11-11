@@ -99,3 +99,13 @@ def calculate_change(
         COST_SCALE, rounding=ROUND_HALF_UP
     )
     return Change(old_quantity - quantity, cost_after, realized)
+
+
+def diluted_average_cost(quantity: int, total_cost: Decimal,
+                         cycle_realized_pnl: Decimal) -> Decimal:
+    """Display-only adjusted basis; trading cost remains moving-average cost."""
+    if type(quantity) is not int or quantity <= 0:
+        raise ValueError("摊薄成本只适用于非零持仓")
+    if not total_cost.is_finite() or not cycle_realized_pnl.is_finite():
+        raise ValueError("计算摊薄成本的金额无效")
+    return (total_cost - cycle_realized_pnl) / quantity
